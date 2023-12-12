@@ -1,13 +1,12 @@
 package sg.nus.news.service;
 
 import java.io.StringReader;
-import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Map;
+import java.util.Optional;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.MediaType;
 import org.springframework.http.RequestEntity;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
@@ -18,80 +17,123 @@ import jakarta.json.Json;
 import jakarta.json.JsonArray;
 import jakarta.json.JsonObject;
 import jakarta.json.JsonReader;
-import jakarta.json.JsonValue;
+import sg.nus.news.Utils;
+import sg.nus.news.model.CountryCode;
 import sg.nus.news.model.News;
+import sg.nus.news.repo.NewsRepository;
 
 @Service
 public class NewsService {
-    @Value("${news.api.key}")
-    private String apiKey;
 
-    public List<String> getCategories() {
-        String[] categories = {"business", "entertainement", "general", "health", "science", "sports", "technology"};
-        return List.of(categories);
-    }
+   @Value("${newsapi.key}")
+   private String apiKey;
 
-    public Map<String, String> getCountries() {
-        Map<String, String> countries = new HashMap<>();
+   @Value("${newsapi.page.size}")
+   private String pageSize;
 
-        String url = UriComponentsBuilder
-                .fromUriString("https://restcountries.com/v3.1/alpha")
-                .queryParam("codes", "ae,ar,at,au,be,bg,br,ca,ch,cn,co,cu,cz,de,eg,fr,gb,gr,hk,hu,id,ie,il,in,it,jp,kr,lt,lv,ma,mx,my,ng,nl,no,nz,ph,pl,pt,ro,rs,ru,sa,se,sg,si,sk,th,tr,tw,ua,us,ve,za")
-                .build()
-                .toString();
+   @Autowired
+   private NewsRepository newsRepo;
 
-        RequestEntity<Void> req = RequestEntity.get(url)
-            .accept(MediaType.APPLICATION_JSON)
-            .build();
+   private List<CountryCode> codes = null;
 
-        RestTemplate restTemplate = new RestTemplate();
+   // GET
+   // /v2/top-headlines?country=us&category=technology&apiKey=abc123&pageSize=10
+   public List<News> getNews(String country, String category) {
 
-        ResponseEntity<String> res = restTemplate.exchange(req, String.class);
+      Optional<String> opt = newsRepo.getNews(country, category);
+      String payload;
+      JsonArray articles;
 
-        JsonReader jr = Json.createReader(new StringReader(res.getBody()));
-        JsonArray ja = jr.readObject().getJsonArray("articles");
+      if (opt.isEmpty()) {
 
-        for (JsonValue val : ja) {
-            JsonObject obj = val.asJsonObject();
-            String countryCode = obj.getString("cca2");
-            String country = obj.getJsonObject("name").getString("common");
-            countries.put(countryCode, country);
-        }
-        return countries;
-    }
+         String url = UriComponentsBuilder
+               .fromUriString("https://newsapi.org/v2/top-headlines")
+               .queryParam("country", country)
+               .queryParam("category", category)
+               .queryParam("pageSize", pageSize)
+               .toUriString();
 
-    public List<News> getNews(String category, String country) {
-        List<News> news = new LinkedList<>();
+         RequestEntity<Void> req = RequestEntity.get(url)
+               .header("X-Api-Key", apiKey)
+               .build();
 
-        String url = UriComponentsBuilder
-            .fromUriString("https://newsapi.org/v2/top-headlines")
-            .queryParam("country", country)
-            .queryParam("category", category)
-            .queryParam("apiKey", apiKey)
-            .build()
-            .toString();
+         RestTemplate template = new RestTemplate();
+         ResponseEntity<String> resp = null;
 
-        RequestEntity<Void> req = RequestEntity.get(url)
-            .accept(MediaType.APPLICATION_JSON)
-            .build();
+         try {
 
-        RestTemplate restTemplate = new RestTemplate();
+            resp = template.exchange(req, String.class);
 
-        ResponseEntity<String> res = restTemplate.exchange(req, String.class);
-        
-        JsonReader jr = Json.createReader(new StringReader(res.getBody()));
-        JsonArray ja = jr.readObject().getJsonArray("articles");
+         } catch (Exception ex) {
+            ex.printStackTrace();
+            return new LinkedList<>();
+         }
 
-        for (JsonValue val : ja) {
-            JsonObject obj = val.asJsonObject();
-            String title = obj.getString("title", "");
-            String urlToImage = obj.getString("urlToImage", "");
-            String author = obj.getString("author", "");
-            String description = obj.getString("description", "");
-            String publishedAt = obj.getString("publishedAt", "");
-            String articleUrl = obj.getString("url", "");
-            news.add(new News(title, urlToImage, author, description, publishedAt, articleUrl));
-        }
-        return news;
-    }
+         payload = resp.getBody();
+         JsonReader reader = Json.createReader(new StringReader(payload));
+         JsonObject result = reader.readObject();
+         articles = result.getJsonArray("articles");
+
+      } else {
+         System.out.println("--------- result from cache --------------");
+         payload = opt.get();
+         JsonReader reader = Json.createReader(new StringReader(payload));
+         articles = reader.readArray();
+      }
+
+      if (opt.isEmpty())
+         newsRepo.cacheNews(country, category, articles);
+
+      // Cache the news
+
+      return articles.stream()
+            .map(j -> j.asJsonObject())
+            .map(o -> {
+               String author = o.getString("author", "Anonymous");
+               String title = o.getString("title");
+               String description = o.getString("description", "No description");
+               String newsUrl = o.getString("url");
+               String image = o.getString("urlToImage",
+                     "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3f/Placeholder_view_vector.svg/310px-Placeholder_view_vector.svg.png");
+               String publish = o.getString("publishedAt");
+               return new News(title, author, description, newsUrl, image, publish);
+            })
+            .toList();
+   }
+
+   public List<CountryCode> getCountryCode() {
+
+      if (null == codes) {
+         // /v3.1/alpha?codes=sg,my,jp
+         String url = UriComponentsBuilder
+               .fromUriString("https://restcountries.com/v3.1/alpha")
+               .queryParam("codes", Utils.getCodeAsCSV())
+               .toUriString();
+
+         // GET /v3.1/alpha?codes=sg,my,jp
+         RequestEntity<Void> req = RequestEntity
+               .get(url).build();
+
+         RestTemplate template = new RestTemplate();
+
+         ResponseEntity<String> resp = template.exchange(req, String.class);
+         String payload = resp.getBody();
+
+         JsonReader reader = Json.createReader(new StringReader(payload));
+         // [ {...}, {...} ]
+         JsonArray arr = reader.readArray();
+         codes = arr.stream()
+               .map(j -> j.asJsonObject())
+               .map(o -> {
+                  String cca2 = o.getString("cca2").toLowerCase();
+                  String name = o.getJsonObject("name").getString("common");
+                  return new CountryCode(cca2, name);
+               })
+               .sorted((c0, c1) -> c0.name().compareTo(c1.name()))
+               .toList();
+      }
+
+      return codes;
+   }
+
 }
